@@ -380,8 +380,18 @@ If the future completes with an error, an exception is thrown.
                             .getSchema();
         auto stack = torch::jit::createStackForSchema(
             fnSchema, args, kwargs, c10::nullopt);
-        auto userRRefPtr = remoteTorchscript(dstWorkerName, name, stack);
-        return PyRRef(userRRefPtr);
+
+        auto rpcAgentPtr = RpcAgent::getCurrentRpcAgent();
+        auto& ctx = RRefContext::getInstance();
+        auto dstWorkerInfo = rpcAgentPtr->getWorkerInfo(dstWorkerName);
+        if (ctx.getWorkerId() != dstWorkerInfo.id_) {
+          auto userRRefPtr = remoteTorchscript(dstWorkerName, name, stack);
+          return PyRRef(userRRefPtr);
+        } else {
+          auto ownerRRefPtr =
+              remoteTorchscriptToOwner(dstWorkerName, name, stack);
+          return PyRRef(ownerRRefPtr);
+        }
       },
       py::call_guard<py::gil_scoped_release>());
 

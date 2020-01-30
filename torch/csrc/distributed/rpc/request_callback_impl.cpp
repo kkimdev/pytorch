@@ -80,6 +80,8 @@ std::shared_ptr<FutureMessage> RequestCallbackImpl::processRpc(
     }
     case MessageType::SCRIPT_REMOTE_CALL: {
       auto& scriptRemoteCall = static_cast<ScriptRemoteCall&>(rpc);
+      auto rrefId = scriptRemoteCall.retRRefId();
+      auto forkId = scriptRemoteCall.retForkId();
       auto& ctx = RRefContext::getInstance();
 
       TypePtr returnType;
@@ -95,8 +97,7 @@ std::shared_ptr<FutureMessage> RequestCallbackImpl::processRpc(
                          .type();
       }
 
-      auto ownerRRef =
-          ctx.getOrCreateOwnerRRef(scriptRemoteCall.retRRefId(), returnType);
+      auto ownerRRef = ctx.getOrCreateOwnerRRef(rrefId, returnType);
 
       // TODO: make this asynchronous
       // scriptRemoteCall is only alive within this block, use reference to
@@ -119,8 +120,10 @@ std::shared_ptr<FutureMessage> RequestCallbackImpl::processRpc(
           stack.size());
 
       ownerRRef->setValue(std::move(stack.front()));
-      ctx.addForkOfOwner(
-          scriptRemoteCall.retRRefId(), scriptRemoteCall.retForkId());
+      if (rrefId != forkId) {
+        ctx.addForkOfOwner(rrefId, forkId);
+      }
+
       return wrap(
           RemoteRet(scriptRemoteCall.retRRefId(), scriptRemoteCall.retForkId())
               .toMessage());
@@ -156,7 +159,7 @@ std::shared_ptr<FutureMessage> RequestCallbackImpl::processRpc(
     case MessageType::SCRIPT_RREF_FETCH_CALL: {
       auto& srf = static_cast<ScriptRRefFetchCall&>(rpc);
       auto& ctx = RRefContext::getInstance();
-      std::shared_ptr<OwnerRRef> rref = ctx.getOwnerRRef(srf.rrefId());
+      c10::intrusive_ptr<OwnerRRef> rref = ctx.getOwnerRRef(srf.rrefId());
       if (rref->hasValue()) { // optional fast-path
         return wrap(ScriptRRefFetchRet({rref->getValue()}).toMessage());
       }
@@ -181,7 +184,7 @@ std::shared_ptr<FutureMessage> RequestCallbackImpl::processRpc(
     case MessageType::PYTHON_RREF_FETCH_CALL: {
       auto& prf = static_cast<PythonRRefFetchCall&>(rpc);
       auto& ctx = RRefContext::getInstance();
-      std::shared_ptr<OwnerRRef> rref = ctx.getOwnerRRef(prf.rrefId());
+      c10::intrusive_ptr<OwnerRRef> rref = ctx.getOwnerRRef(prf.rrefId());
       if (rref->hasValue()) { // optional fast-path
         auto value = rref->getValue();
         py::object pyValue;

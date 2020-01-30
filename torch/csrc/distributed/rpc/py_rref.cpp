@@ -10,7 +10,7 @@ namespace distributed {
 namespace rpc {
 ///////////////////////////  PyRRef  //////////////////////////////////
 
-PyRRef::PyRRef(std::shared_ptr<RRef> rref) : rref_(std::move(rref)) {
+PyRRef::PyRRef(c10::intrusive_ptr<RRef> rref) : rref_(std::move(rref)) {
   TORCH_CHECK(rref_, "PyRRef must not wrap nullptr");
 }
 
@@ -38,7 +38,8 @@ py::object PyRRef::toHere() {
   } else {
     // toHere() calls python_rpc_handler which acquires GIL when UserRRef holds
     // a python object
-    IValue value = std::static_pointer_cast<UserRRef>(rref_)->toHere();
+    IValue value =
+        c10::static_intrusive_pointer_cast<UserRRef>(rref_)->toHere();
     {
       // acquiring GIL as torch::jit::toPyObject creates new py::object
       // without grabbing the GIL.
@@ -55,7 +56,7 @@ py::object PyRRef::localValue() {
       owner().name_);
 
   py::object res;
-  auto value = std::dynamic_pointer_cast<OwnerRRef>(rref_)->getValue();
+  auto value = c10::static_intrusive_pointer_cast<OwnerRRef>(rref_)->getValue();
   auto& rpcHandler = PythonRpcHandler::getInstance();
   {
     // acquiring GIL as torch::jit::toPyObject creates new py::object without
@@ -72,9 +73,8 @@ std::string PyRRef::str() const {
   if (rref_->isOwner()) {
     ss << "OwnerRRef(" << rref_->rrefId() << ")";
   } else {
-    ss << "UserRRef(RRefId = " << rref_->rrefId()
-       << ", ForkId = " << std::static_pointer_cast<UserRRef>(rref_)->forkId()
-       << ")";
+    ss << "UserRRef(RRefId = " << rref_->rrefId() << ", ForkId = "
+       << c10::static_intrusive_pointer_cast<UserRRef>(rref_)->forkId() << ")";
   }
   return ss.str();
 }
@@ -92,13 +92,18 @@ py::tuple PyRRef::pickle() const {
 PyRRef PyRRef::unpickle(const py::tuple& t) {
   auto& ctx = RRefContext::getInstance();
   auto rfd = RRefForkData::fromPyTuple(t.cast<py::tuple>());
-  std::shared_ptr<RRef> rref = nullptr;
   TypePtr rref_type =
       PythonRpcHandler::getInstance().parseTypeFromStr(rfd.type_str_);
-  rref = ctx.getOrCreateRRef(rfd, rref_type);
+  c10::intrusive_ptr<RRef> rref = ctx.getOrCreateRRef(rfd, rref_type);
 
   ctx.notifyOwnerAndParentOfFork(rfd.forkId_, rfd.parent_, rref);
   return PyRRef(std::move(rref));
+}
+
+c10::IValue PyRRef::toIValue() {
+  // cast to RRefInterface to hold it into IValue
+  auto rrefPtr = c10::static_intrusive_pointer_cast<c10::RRefInterface>(rref_);
+  return IValue(rrefPtr);
 }
 
 } // namespace rpc
