@@ -21,6 +21,9 @@ from ..autograd.utils import CodeTemplate, YamlLoader, write
 from ..autograd.gen_autograd import load_aten_declarations
 from ..autograd.gen_autograd import RETURNS_VIEWS_OF_INPUT
 
+from tools.shared.module_loader import import_module
+TOUtils = import_module('tensor_options_utils', 'aten/src/ATen/tensor_options_utils.py')
+
 # JIT has a type system of
 # Scalar = int | float | bool # int is the largest int (int64_t),
 # float is the largest float (double) we don't have the others because they are never held in tensors
@@ -155,9 +158,21 @@ const auto options = TensorOptions()
         .device(${device})
         .pinned_memory(${pin_memory});
 #ifdef USE_STATIC_DISPATCH
-    auto result_ = at::${name}(${args_with_tensor_options});
+    auto result_ = at::${name}(${args_with_tensor_options_disp});
 #else
-    auto result_ = torch::${name}(${args_with_tensor_options});
+    auto result_ = torch::_${name}(${args_with_tensor_options});
+#endif
+""")
+CALL_NAMESPACE_WITH_TENSOR_OPTIONS_ARANGE = CodeTemplate("""\
+const auto options = TensorOptions()
+        .dtype(${dtype})
+        .layout(${layout})
+        .device(${device})
+        .pinned_memory(${pin_memory});
+#ifdef USE_STATIC_DISPATCH
+    auto result_ = at::${name}(${args_with_tensor_options_disp});
+#else
+    auto result_ = options.has_dtype() ? torch::_${name}(${args_with_tensor_options}) : torch::_${name}(${args_with_tensor_options_nullopt});
 #endif
 """)
 CALL_METHOD_WITH_TENSOR_OPTIONS = CodeTemplate("""\
@@ -289,24 +304,46 @@ def gen_jit_dispatch(declarations, out, template_path, disable_autograd=False, s
         def pack_arguments(args):
             return ',\n'.join(args)
         is_namespace_function = 'namespace' in decl['method_of']
-        tensor_options_arg_index = decl.get('tensor_options_arg_index', None)
-        if tensor_options_arg_index is not None:
+
+        if TOUtils.check_if_factory_method(decl['arguments']):
+            if 'ScalarType dtype' in decl['formals']:
+                tensor_options_arg_index = decl['formals'].index('ScalarType dtype')
+            if 'c10::optional<ScalarType> dtype' in decl['formals']:
+                tensor_options_arg_index = decl['formals'].index('c10::optional<ScalarType> dtype')
+
             dtype = args[tensor_options_arg_index]
             layout = args[tensor_options_arg_index + 1]
             device = args[tensor_options_arg_index + 2]
             pin_memory = args[tensor_options_arg_index + 3]
-            args_with_tensor_options = args[:tensor_options_arg_index] + \
+
+            args_with_tensor_options_disp = args[:tensor_options_arg_index] + \
                 ['options'] + args[(tensor_options_arg_index + 4):]
+            args_with_tensor_options = args[:tensor_options_arg_index] + \
+                ['at::typeMetaToScalarType(options.dtype())', 'options.layout(), options.device(), options.pinned_memory(), options.requires_grad()'] + args[(tensor_options_arg_index + 4):]
+
             if is_namespace_function:
-                return CALL_NAMESPACE_WITH_TENSOR_OPTIONS.substitute(
-                    name=decl['name'], dtype=dtype, layout=layout,
-                    device=device, pin_memory=pin_memory,
-                    args_with_tensor_options=pack_arguments(args_with_tensor_options))
+                if (decl['name'] == 'arange'):
+                    args_with_tensor_options_nullptr = args_with_tensor_options[:]
+                    index = args_with_tensor_options.index('at::typeMetaToScalarType(options.dtype())')
+                    args_with_tensor_options_nullptr[index] = 'c10::nullopt'
+
+                    return CALL_NAMESPACE_WITH_TENSOR_OPTIONS_ARANGE.substitute(
+                        name=decl['name'], dtype=dtype, layout=layout,
+                        device=device, pin_memory=pin_memory,
+                        args_with_tensor_options=pack_arguments(args_with_tensor_options),
+                        args_with_tensor_options_nullopt=pack_arguments(args_with_tensor_options_nullptr),
+                        args_with_tensor_options_disp=pack_arguments(args_with_tensor_options_disp))
+                else:
+                    return CALL_NAMESPACE_WITH_TENSOR_OPTIONS.substitute(
+                        name=decl['name'], dtype=dtype, layout=layout,
+                        device=device, pin_memory=pin_memory,
+                        args_with_tensor_options=pack_arguments(args_with_tensor_options),
+                        args_with_tensor_options_disp=pack_arguments(args_with_tensor_options_disp))
             else:
                 return CALL_METHOD_WITH_TENSOR_OPTIONS.substitute(
                     name=decl['name'], dtype=dtype, layout=layout,
                     device=device, pin_memory=pin_memory,
-                    args_with_tensor_options=pack_arguments(args_with_tensor_options[1:]),
+                    args_with_tensor_options=pack_arguments(args_with_tensor_options_disp[1:]),
                     first=args_with_tensor_options[0], num_inputs=num_inputs)
         else:
             if is_namespace_function:
@@ -435,7 +472,7 @@ def gen_jit_dispatch(declarations, out, template_path, disable_autograd=False, s
                 el['simple_type'] += '?'
                 el['default'] = 'None'
         if 'default' in arg and arg['default'] == 'at::kLong':
-            tensor_options_expansion[0]['default'] = 'long'
+            tensor_options_expansion[0]['default'] = 'at::kLong'
         if 'kwarg_only' in arg and arg['kwarg_only']:
             for el in tensor_options_expansion:
                 el['kwarg_only'] = True
@@ -514,6 +551,7 @@ def needs_hacked_twin(decl):
     schema_string = decl['schema_string']
     return any([schema_string.startswith(name) for name in NEEDS_HACKED_TWIN_NAMES])
 
+<<<<<<< HEAD
 
 def hacked_twin(decl):
     decl_copy = copy.deepcopy(decl)
@@ -522,6 +560,61 @@ def hacked_twin(decl):
         if arg['simple_type'] == 'TensorList' and arg.get('is_nullable'):
             arg['is_nullable'] = False
     return decl_copy
+=======
+def signature(decl, should_match_schema=True):
+    def format_arg(arg):
+        name = arg['name']
+        typ = jit_type_of(arg)
+        decl = '{} {}'.format(typ, name)
+        if 'default' in arg:
+            # clean up initializer lists {{true, true}} -> [true, true]
+            default = arg['default']
+            # NOTE: str(float) in python2 truncates, which makes JIT signatures not match native_functions
+            # signatures.  repr(float) doesn't seem to truncate in these cases.
+            default = str(default) if not isinstance(default, float) else repr(default)
+            default = default \
+                .replace('{{', '[') \
+                .replace('}}', ']') \
+                .replace('true', 'True') \
+                .replace('false', 'False') \
+                .replace('at::Reduction::Mean', 'Mean') \
+                .replace('MemoryFormat::Contiguous', 'contiguous_format') \
+                .replace('QScheme::PER_TENSOR_AFFINE', 'per_tensor_affine') \
+                .replace('{}', 'None' if is_tensor_arg(arg) else '[]') \
+                .replace('{', '[') \
+                .replace('}', ']') \
+                .replace('}', ']') \
+                .replace('at::kLong', 'long')
+
+            default = default_map.get(default, default)
+            decl = '{}={}'.format(decl, default)
+        return decl
+
+    args = []
+    kwarg_only = False
+
+    ordered_arguments = sorted(zip(argument_order(decl), decl['arguments']))
+    for _, a in ordered_arguments:
+        if not kwarg_only and is_kwarg_only(a):
+            args.append('*')
+            kwarg_only = True
+        args.append(format_arg(a))
+
+    arg_list = ', '.join(args)
+    if len(decl['returns']) == 1:
+        ret_list = jit_type_of(decl['returns'][0])
+        # Adding output name if it exists
+        if decl['returns'][0].get('field_name'):
+            ret_list += ' ' + decl['returns'][0]['field_name']
+    else:
+        def type_maybe_field(r):
+            return '{} {}'.format(jit_type_of(r), r['field_name']) if 'field_name' in r else jit_type_of(r)
+        ret_list = '({})'.format(', '.join(type_maybe_field(r) for r in decl['returns']))
+    name = decl['name'] if not is_out_variant(decl) else decl['name'][:-4]
+    overload_name = '.' + decl['overload_name'] if not decl['overload_name'] == '' else ''
+    constructed_string = 'aten::{}{}({}) -> {}'.format(name, overload_name, arg_list, ret_list)
+    return match_signature(decl, constructed_string, should_match_schema)
+>>>>>>> b3db154e35... Updated codegen to remove TensorOptions from generated code
 
 
 def signature_without_args(decl):
